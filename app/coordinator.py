@@ -4,6 +4,17 @@ Responsibilities
 ----------------
 * Validate the uploaded CSV and deterministically split it into two
   mutually-exclusive shards, one per independent worker process.
+* Admit AT MOST ONE task: job creation is serialised by an asyncio lock, so
+  two concurrent uploads can never both be accepted — the loser gets an
+  explicit 409 and never touches durable files, the workers, or the response
+  of the winner.
+* Deliver shards with a worker-side compare-and-swap fence (``shard_hash`` +
+  ``expected_current``): a late or foreign shard push can never overwrite the
+  accepted task's shard on a worker.
+* Gate training on shard identity: ``/api/start`` only opens a generation
+  after both workers provably hold this task's shards (task id + content hash
+  + coverage); a missing shard is re-delivered from the durable job document
+  so recovery never needs a CSV re-upload.
 * Drive round-by-round synchronous training: ask both workers for their shard
   gradients, combine them into the *full-data average gradient*, ask both
   workers to apply the identical momentum step and durably persist it, and
@@ -36,7 +47,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import lrmath
-from storage import (atomic_write_json, exists,
+from storage import (atomic_write_json, content_hash, exists,
                      if_exists_read_json, read_json)
 
 DATA_DIR = os.environ.get("COORD_DATA", "/data")
@@ -64,6 +75,9 @@ class Ctx:
         self.task: Optional[asyncio.Task] = None
         self.client: Optional[httpx.AsyncClient] = None
         self.worker_live: Dict[str, bool] = {k: False for k in WORKERS}
+        # Serialises every job-lifecycle mutation (create / reset / start
+        # gate). The training loop itself never takes it.
+        self.job_lock: asyncio.Lock = asyncio.Lock()
 
 
 CTX = Ctx()
@@ -200,6 +214,73 @@ async def worker_health(worker_id: str) -> Dict[str, Any]:
         return {"worker_id": worker_id, "alive": False, "error": str(exc)}
 
 
+# ============================================================ shard delivery
+def job_shard_rows(job: Dict[str, Any], worker_id: str) -> List[Dict[str, Any]]:
+    """Rebuild this worker's shard rows from the durable job document.
+
+    The job stores the full dataset plus the deterministic split indices, so
+    a shard can always be re-delivered without the original CSV upload.
+    """
+    return [{"x": [float(job["x"][i][0]), float(job["x"][i][1])],
+             "y": float(job["y"][i])} for i in job["shards"][worker_id]]
+
+
+async def ensure_worker_shard(worker_id: str,
+                              job: Dict[str, Any]) -> Dict[str, Any]:
+    """Make ``worker_id`` hold exactly this job's shard and verify identity.
+
+    The worker must report the job's task id, the shard's content hash and
+    the expected row count. If it holds nothing (or a stale, previously
+    accepted task), the shard is (re)delivered from the durable job document
+    with a compare-and-swap token naming what the worker currently holds, so
+    a worker can never be silently overwritten by an unexpected task. Raises
+    RuntimeError when the worker is unreachable or refuses the shard.
+    """
+    want_hash = job["shard_hashes"][worker_id]
+    want_n = len(job["shards"][worker_id])
+    last_err = "unknown"
+    for _attempt in (1, 2):
+        h = await worker_health(worker_id)
+        if not h.get("alive"):
+            raise RuntimeError(f"{worker_id} is unreachable")
+        if (h.get("task_id") == job["task_id"]
+                and h.get("shard_hash") == want_hash
+                and int(h.get("n") or -1) == want_n):
+            return h  # already consistent: nothing to do
+        payload = {
+            "task_id": job["task_id"], "worker_id": worker_id,
+            "rows": job_shard_rows(job, worker_id),
+            "shard_hash": want_hash,
+            "expected_current": h.get("task_id"),
+        }
+        try:
+            res = await worker_call(worker_id, "/load", payload)
+        except HTTPException as exc:
+            # CAS mismatch (our view of the worker was stale): re-query once.
+            last_err = f"HTTP {exc.status_code}: {exc.detail}"
+            continue
+        except httpx.HTTPError as exc:
+            raise RuntimeError(
+                f"{worker_id} unreachable during shard load: {exc}")
+        if (res.get("task_id") == job["task_id"]
+                and res.get("shard_hash") == want_hash
+                and int(res.get("n") or -1) == want_n):
+            return res
+        last_err = f"unexpected load response: {res}"
+    raise RuntimeError(f"{worker_id} refuses shard for task "
+                       f"{job['task_id'][:8]}: {last_err}")
+
+
+async def ensure_shards_consistent(job: Dict[str, Any]) -> None:
+    """Gate for training: both workers must provably hold THIS task's shards
+    (task identity + content hash), together covering the whole dataset."""
+    infos = [await ensure_worker_shard(wid, job) for wid in WORKERS]
+    total = sum(int(i.get("n") or 0) for i in infos)
+    if total != int(job["n"]):
+        raise RuntimeError(
+            f"shard coverage {total} != dataset size {job['n']}")
+
+
 # ============================================================ training loop
 async def run_training() -> None:
     """Round machine. A failure at any point pauses the whole group; progress
@@ -297,8 +378,12 @@ async def run_training() -> None:
 
 
 def ensure_not_busy() -> None:
-    if CTX.status and CTX.status["status"] == "running":
+    if CTX.status and CTX.status["status"] in ("running", "preparing"):
         raise HTTPException(409, "a round is currently in progress")
+
+
+def err_msg(exc: BaseException) -> str:
+    return str(getattr(exc, "detail", None) or exc)
 
 
 # ============================================================ API: schemas
@@ -313,9 +398,11 @@ async def lifespan(app: FastAPI):
     CTX.client = httpx.AsyncClient()
     CTX.job = if_exists_read_json(JOB_PATH)
     CTX.status = if_exists_read_json(STATUS_PATH)
-    if CTX.status is not None and CTX.status["status"] == "running":
-        # Coordinator died mid-round: nothing after the last confirmed round
-        # may count. Mark paused; the next resume re-prepares both workers.
+    if CTX.status is not None and CTX.status["status"] in ("running",
+                                                           "preparing"):
+        # Coordinator died mid-round (or mid-prepare): nothing after the last
+        # confirmed round may count. Mark paused; the next resume re-verifies
+        # shard identity and re-prepares both workers.
         CTX.status["status"] = "paused"
         CTX.status["running_round"] = None
         CTX.status["last_event"] = (
@@ -344,6 +431,13 @@ async def status() -> JSONResponse:
     out: Dict[str, Any] = {"workers": {h["worker_id"]: h for h in health}}
     if CTX.status:
         out.update(CTX.status)
+    if CTX.job:
+        # Per-worker shard identity vs the accepted task, for the web UI.
+        for wid, h in out["workers"].items():
+            h["shard_match"] = bool(
+                h.get("alive")
+                and h.get("task_id") == CTX.job["task_id"]
+                and h.get("shard_hash") == CTX.job["shard_hashes"].get(wid))
     out["worker_live"] = CTX.worker_live
     out["weights_available"] = exists(LATEST_WEIGHTS)
     return JSONResponse(out)
@@ -354,67 +448,84 @@ async def create_job(file: UploadFile = File(...),
                      rounds: int = 10) -> JSONResponse:
     if not (1 <= rounds <= 100):
         raise HTTPException(400, "rounds must be in [1,100]")
-    if CTX.status and CTX.status["status"] not in ("completed",):
-        raise HTTPException(409, "a task already exists; reset it first")
-    raw = await file.read()
-    x, y = parse_csv(raw)
-    n = len(y)
-    idx1, idx2 = split_indices(n)
+    # Single-admission: the whole check -> persist -> shard-delivery sequence
+    # runs under one lock, so two concurrent uploads can never both pass the
+    # conflict check. The loser is rejected BEFORE it can touch any durable
+    # file, any worker, or the winner's response.
+    async with CTX.job_lock:
+        have_task = CTX.job is not None or CTX.status is not None
+        completed = bool(CTX.status) and CTX.status.get("status") == "completed"
+        if have_task and not completed:
+            raise HTTPException(
+                409, "已有受理中的训练任务，本次并发上传被拒绝；"
+                     "请等待其完成或先清除当前任务 (reset)")
+        raw = await file.read()
+        x, y = parse_csv(raw)
+        n = len(y)
+        idx1, idx2 = split_indices(n)
 
-    task_id = uuid.uuid4().hex
-    rows_all = [{"x": [float(x[i, 0]), float(x[i, 1])], "y": float(y[i])}
-                for i in range(n)]
-    shards = {
-        "worker1": [{"x": r["x"], "y": r["y"]}
-                    for r in (rows_all[i] for i in idx1)],
-        "worker2": [{"x": r["x"], "y": r["y"]}
-                    for r in (rows_all[i] for i in idx2)],
-    }
-    job = {
-        "task_id": task_id, "rounds": int(rounds), "n": n,
-        "x": [[float(a), float(b)] for a, b in x],
-        "y": [float(v) for v in y],
-        "shards": {"worker1": idx1, "worker2": idx2},
-        "created_at": now_ms(),
-        "hyper": {"lr": lrmath.LEARNING_RATE,
-                  "momentum": lrmath.MOMENTUM},
-    }
-    # Durable first, before touching any worker.
-    atomic_write_json(JOB_PATH, job)
-    CTX.job = job  # keep in-memory context in sync with the durable file
-    zero = lrmath.to_list(lrmath.zero_buffers())
-    status_doc = {
-        "task_id": task_id, "gen": 0,
-        "status": "idle", "confirmed_round": 0,
-        "total_rounds": int(rounds),
-        "w": zero, "v": zero,
-        "loss_history": [{"round": 0,
-                          "loss": lrmath.bce_loss(lrmath.augment(x), y, zero),
-                          "at": now_ms()}],
-        "running_round": None, "last_event": "task created",
-        "last_error": None, "created_at": now_ms(),
-    }
-    save_status(status_doc)
-    write_weights_artifact(0, zero, zero, status_doc["loss_history"][0]["loss"])
+        task_id = uuid.uuid4().hex
+        rows_all = [{"x": [float(x[i, 0]), float(x[i, 1])], "y": float(y[i])}
+                    for i in range(n)]
+        shard_rows = {
+            "worker1": [rows_all[i] for i in idx1],
+            "worker2": [rows_all[i] for i in idx2],
+        }
+        shard_hashes = {wid: content_hash(shard_rows[wid]) for wid in WORKERS}
+        job = {
+            "task_id": task_id, "rounds": int(rounds), "n": n,
+            "x": [[float(a), float(b)] for a, b in x],
+            "y": [float(v) for v in y],
+            "shards": {"worker1": idx1, "worker2": idx2},
+            "shard_hashes": shard_hashes,
+            "created_at": now_ms(),
+            "hyper": {"lr": lrmath.LEARNING_RATE,
+                      "momentum": lrmath.MOMENTUM},
+        }
+        # Durable first, before touching any worker.
+        atomic_write_json(JOB_PATH, job)
+        CTX.job = job  # keep in-memory context in sync with the durable file
+        zero = lrmath.to_list(lrmath.zero_buffers())
+        status_doc = {
+            "task_id": task_id, "gen": 0,
+            "status": "idle", "confirmed_round": 0,
+            "total_rounds": int(rounds),
+            "w": zero, "v": zero,
+            "loss_history": [{"round": 0,
+                              "loss": lrmath.bce_loss(lrmath.augment(x), y,
+                                                      zero),
+                              "at": now_ms()}],
+            "running_round": None, "last_event": "task created",
+            "last_error": None, "created_at": now_ms(),
+        }
+        save_status(status_doc)
+        write_weights_artifact(0, zero, zero,
+                               status_doc["loss_history"][0]["loss"])
 
-    # Push the mutually-exclusive shards to the two independent processes.
-    results = await asyncio.gather(*(
-        worker_call(wid, "/load",
-                    {"task_id": task_id, "worker_id": wid,
-                     "rows": shards[wid]}, tolerate=True)
-        for wid in WORKERS))
-    for wid, res in zip(WORKERS, results):
-        if "_error" in res:
-            st = dict(CTX.status)
+        # Push the mutually-exclusive shards to the two independent processes.
+        # A worker that is unreachable right now does NOT doom the task: the
+        # shard is re-delivered from the durable job on start/resume, so no
+        # CSV re-upload is ever needed.
+        failed: Dict[str, str] = {}
+        for wid in WORKERS:
+            try:
+                await ensure_worker_shard(wid, job)
+            except Exception as exc:  # noqa: BLE001 - reported as task state
+                failed[wid] = err_msg(exc)
+        if failed:
+            st = dict(status_doc)
             st["status"] = "paused"
-            st["last_error"] = f"shard load to {wid} failed: {res['_error']}"
-            st["last_event"] = "task created but a worker is unreachable"
+            st["last_error"] = "; ".join(f"{w}: {e}"
+                                         for w, e in failed.items())
+            st["last_event"] = ("task accepted; shard delivery pending for "
+                                + ",".join(failed)
+                                + "; start/resume retries automatically")
             save_status(st)
             return JSONResponse(st, status_code=202)
-    st = dict(CTX.status)
-    st["last_event"] = "shards loaded on both workers; press Start"
-    save_status(st)
-    return JSONResponse(st)
+        st = dict(status_doc)
+        st["last_event"] = "shards verified on both workers; press Start"
+        save_status(st)
+        return JSONResponse(st)
 
 
 async def _prepare_workers(gen: int) -> None:
@@ -435,21 +546,42 @@ async def _prepare_workers(gen: int) -> None:
 
 @app.post("/api/start")
 async def start() -> JSONResponse:
-    job, st = require_job()
-    ensure_not_busy()
-    if st["status"] not in ("idle", "paused"):
-        raise HTTPException(409, f"cannot start from status {st['status']}")
-    new_gen = int(st["gen"]) + 1  # every (re)start opens a new training group
-    st = dict(st)
-    st["gen"] = new_gen
-    st["status"] = "preparing"
-    st["last_error"] = None
-    st["last_event"] = f"opening training generation {new_gen}"
-    save_status(st)
-    await _prepare_workers(new_gen)
-    CTX.task = asyncio.create_task(run_training())
-    return JSONResponse(save_status({**st, "last_event":
-                                     f"generation {new_gen} prepared; running"}))
+    # The start gate mutates job-scoped state, so it shares the lifecycle
+    # lock with create/reset. The training loop itself runs lock-free.
+    async with CTX.job_lock:
+        job, st = require_job()
+        ensure_not_busy()
+        if st["status"] not in ("idle", "paused"):
+            raise HTTPException(409, f"cannot start from status {st['status']}")
+        new_gen = int(st["gen"]) + 1  # every (re)start opens a new group
+        st = dict(st)
+        st["gen"] = new_gen
+        st["status"] = "preparing"
+        st["last_error"] = None
+        st["last_event"] = f"opening training generation {new_gen}"
+        save_status(st)
+        try:
+            # Shard/task identity gate: the web page may only start training
+            # once BOTH workers provably hold this task's shards. Missing or
+            # stale shards are re-delivered from the durable job document
+            # (never from a re-uploaded CSV, never from another request).
+            await ensure_shards_consistent(job)
+            await _prepare_workers(new_gen)
+        except Exception as exc:
+            # Keep the accepted task exactly as it was: paused, recoverable
+            # via the ordinary Resume button once the side is back.
+            st2 = dict(CTX.status)
+            st2["status"] = "paused"
+            st2["running_round"] = None
+            st2["last_error"] = f"{type(exc).__name__}: {err_msg(exc)}"
+            st2["last_event"] = ("start aborted; accepted task kept, "
+                                 "no CSV re-upload needed")
+            save_status(st2)
+            raise HTTPException(503, f"cannot start: {err_msg(exc)}")
+        CTX.task = asyncio.create_task(run_training())
+        return JSONResponse(save_status({**st, "last_event":
+                                         f"generation {new_gen} prepared; "
+                                         f"running"}))
 
 
 @app.post("/api/resume")
@@ -477,15 +609,29 @@ async def pause() -> JSONResponse:
 
 @app.post("/api/reset")
 async def reset() -> JSONResponse:
-    ensure_not_busy()
-    for p in (JOB_PATH, STATUS_PATH):
-        try:
-            os.unlink(p)
-        except FileNotFoundError:
-            pass
-    CTX.job = None
-    CTX.status = None
-    return JSONResponse({"ok": True, "event": "task cleared"})
+    async with CTX.job_lock:
+        ensure_not_busy()
+        if CTX.task is not None and not CTX.task.done():
+            raise HTTPException(409, "training task still active")
+        # Best-effort clear of both workers first, so a later upload starts
+        # from truly empty processes. An unreachable worker keeps its stale
+        # shard for now; the next upload's CAS delivery then names and
+        # replaces it explicitly.
+        cleared: Dict[str, Any] = {}
+        for wid in WORKERS:
+            res = await worker_call(wid, "/reset", {}, tolerate=True)
+            cleared[wid] = ("cleared" if "_error" not in res
+                            else f"unreachable: {res['_error']}")
+        for p in (JOB_PATH, STATUS_PATH):
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+        CTX.job = None
+        CTX.status = None
+        CTX.task = None
+        return JSONResponse({"ok": True, "workers": cleared,
+                             "event": "task cleared"})
 
 
 @app.post("/api/workers/{worker_id}/delay")

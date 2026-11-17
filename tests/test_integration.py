@@ -9,11 +9,18 @@ temporary data directory, exactly like the Docker topology) and verifies:
    exact uninterrupted trajectory (no skipped / double-applied round);
 3. redoing an unconfirmed round after coordinator restart stays exact;
 4. stale-generation messages are fenced (409) and cannot advance a new group;
-5. downloaded weights only ever reflect confirmed rounds.
+5. downloaded weights only ever reflect confirmed rounds;
+6. concurrent uploads admit exactly one task: the loser gets an explicit 409
+   and its samples never reach any worker;
+7. workers fence shard loads with a compare-and-swap token, so a late/foreign
+   shard push can never overwrite the accepted task;
+8. a task accepted while one side is unreachable recovers via the ordinary
+   start/resume path (shard re-delivery), with no CSV re-upload.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -26,6 +33,9 @@ from pathlib import Path
 import httpx
 import numpy as np
 import pytest
+
+from app import lrmath
+from app.storage import content_hash
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app"
@@ -120,16 +130,28 @@ def cluster(tmp_path):
 
 
 def _dataset_csv(tmp_path: Path, n: int = 40) -> Path:
-    rng = np.random.default_rng(7)
+    p = tmp_path / "data.csv"
+    p.write_text(_csv_text(n, seed=7), encoding="utf-8")
+    return p
+
+
+def _csv_text(n: int, seed: int) -> str:
+    rng = np.random.default_rng(seed)
     x = rng.normal(size=(n, 2))
     z = 1.2 * x[:, 0] - 0.6 * x[:, 1]
     y = (1 / (1 + np.exp(-z)) > 0.5).astype(int)
-    p = tmp_path / "data.csv"
     lines = ["x1,x2,label"]
     for (a, b), c in zip(x, y):
         lines.append(f"{a:.10f},{b:.10f},{c}")
-    p.write_text("\n".join(lines), encoding="utf-8")
-    return p
+    return "\n".join(lines)
+
+
+def _parse_csv_text(text: str):
+    lines = [l for l in text.splitlines() if l.strip()]
+    rows = lines[1:]  # drop the header row
+    x = np.array([[float(v) for v in l.split(",")[:2]] for l in rows])
+    y = np.array([float(l.split(",")[2]) for l in rows])
+    return x, y
 
 
 def _wait_status(base, predicate, timeout=40):
@@ -417,3 +439,238 @@ def test_delay_endpoint_survives_and_rounds_still_exact(cluster, tmp_path):
     ref = httpx.get(base + "/api/reference", timeout=10).json()
     for k, point in enumerate(st["loss_history"]):
         assert point["loss"] == ref["loss"][k]
+
+
+# ------------------------------------------------------- concurrency control
+def test_concurrent_uploads_single_winner(cluster, tmp_path):
+    """Two engineers uploading different CSVs at the same time: exactly one
+    task is admitted, the other gets an explicit 409, responses never carry a
+    foreign task id, and both workers end up holding the WINNER's shards."""
+    base = cluster["coord"]
+    csv_a = _csv_text(40, seed=7)
+    csv_b = _csv_text(35, seed=21)  # different content AND different row count
+
+    async def race():
+        async with httpx.AsyncClient(base_url=base, timeout=30) as c:
+            return await asyncio.gather(
+                c.post("/api/job?rounds=6",
+                       files={"file": ("a.csv", csv_a, "text/csv")}),
+                c.post("/api/job?rounds=6",
+                       files={"file": ("b.csv", csv_b, "text/csv")}))
+
+    r_a, r_b = asyncio.run(race())
+    codes = sorted([r_a.status_code, r_b.status_code])
+    assert codes == [200, 409], f"expected one winner one conflict, got {codes}"
+    loser = r_a if r_a.status_code == 409 else r_b
+    assert "冲突" in loser.json()["detail"] or "拒绝" in loser.json()["detail"]
+
+    win_resp, win_csv = ((r_a, csv_a) if r_a.status_code == 200
+                         else (r_b, csv_b))
+    task_id = win_resp.json()["task_id"]
+
+    # Coordinator state and BOTH workers must belong to the winner's task.
+    st = httpx.get(base + "/api/status", timeout=5).json()
+    assert st["task_id"] == task_id and st["status"] == "idle"
+    x_win, y_win = _parse_csv_text(win_csv)
+    n_win = len(y_win)
+    n_seen = 0
+    for wid in ("worker1", "worker2"):
+        h = st["workers"][wid]
+        assert h["alive"] and h["task_id"] == task_id
+        assert h["shard_match"] is True
+        n_seen += h["n"]
+    assert n_seen == n_win  # full coverage, no foreign samples mixed in
+
+    # The admitted task trains to completion and matches the winner's CSV
+    # bit-for-bit (any leaked sample from the loser would diverge here).
+    httpx.post(base + "/api/start", timeout=15).raise_for_status()
+    st = _wait_status(base, lambda d: d["status"] == "completed")
+    ws, vs, losses = lrmath.reference_train(x_win, y_win, 6)
+    for k, point in enumerate(st["loss_history"]):
+        assert point["loss"] == losses[k], f"round {k} differs"
+    np.testing.assert_array_equal(np.asarray(st["w"]), np.asarray(ws[-1]))
+
+
+def test_concurrent_upload_storm_admits_exactly_one(cluster, tmp_path):
+    """Stress variant: 8 simultaneous uploads -> 1 accepted, 7 conflicts."""
+    base = cluster["coord"]
+    csvs = {f"u{k}.csv": _csv_text(30 + k, seed=100 + k) for k in range(8)}
+
+    async def storm():
+        async with httpx.AsyncClient(base_url=base, timeout=30) as c:
+            return await asyncio.gather(*(
+                c.post("/api/job?rounds=4",
+                       files={"file": (name, text, "text/csv")})
+                for name, text in csvs.items()))
+
+    rs = asyncio.run(storm())
+    codes = [r.status_code for r in rs]
+    assert codes.count(200) == 1, codes
+    assert codes.count(409) == len(csvs) - 1, codes
+    winner_task = next(r.json()["task_id"] for r in rs if r.status_code == 200)
+    st = httpx.get(base + "/api/status", timeout=5).json()
+    assert st["task_id"] == winner_task
+    for wid in ("worker1", "worker2"):
+        assert st["workers"][wid]["task_id"] == winner_task
+        assert st["workers"][wid]["shard_match"] is True
+
+
+def test_worker_load_cas_fencing(cluster, tmp_path):
+    """Worker-level fencing: a late/foreign shard push must not overwrite the
+    accepted task; authorised replacement requires naming the held task."""
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=4)
+    st = _wait_status(base, lambda d: d["status"] == "completed")
+    task_id = st["task_id"]
+    w1 = f"http://127.0.0.1:{cluster['w1'].port}"
+
+    shard = json.loads((cluster["paths"]["w1"] / "shard.json").read_text())
+    rows, shard_hash = shard["rows"], shard["shard_hash"]
+
+    # 1) Idempotent re-delivery of the SAME shard: accepted, state preserved.
+    r = httpx.post(w1 + "/load", json={
+        "task_id": task_id, "worker_id": "worker1", "rows": rows,
+        "shard_hash": shard_hash, "expected_current": None}, timeout=5)
+    assert r.status_code == 200 and r.json()["reloaded"] is True
+    assert r.json()["round"] == 4  # training state NOT wiped
+
+    # 2) Foreign task without a CAS token -> 409, nothing changes.
+    foreign_rows = [{"x": [1.0, 2.0], "y": 1.0}, {"x": [3.0, 4.0], "y": 0.0}]
+    foreign_hash = content_hash(foreign_rows)
+    for bad_token in (None, "some-other-task"):
+        r = httpx.post(w1 + "/load", json={
+            "task_id": "foreign-task", "worker_id": "worker1",
+            "rows": foreign_rows, "shard_hash": foreign_hash,
+            "expected_current": bad_token}, timeout=5)
+        assert r.status_code == 409
+    h = httpx.get(w1 + "/health", timeout=5).json()
+    assert h["task_id"] == task_id and h["round"] == 4
+
+    # 3) Same task id but different content -> 409 (corruption is loud).
+    r = httpx.post(w1 + "/load", json={
+        "task_id": task_id, "worker_id": "worker1", "rows": foreign_rows,
+        "shard_hash": foreign_hash, "expected_current": task_id}, timeout=5)
+    assert r.status_code == 409
+
+    # 4) Content hash not matching the actual rows -> 400.
+    r = httpx.post(w1 + "/load", json={
+        "task_id": "t2", "worker_id": "worker1", "rows": foreign_rows,
+        "shard_hash": "0" * 64, "expected_current": task_id}, timeout=5)
+    assert r.status_code == 400
+
+    # 5) Authorised replacement: CAS token names the held task -> accepted.
+    r = httpx.post(w1 + "/load", json={
+        "task_id": "foreign-task", "worker_id": "worker1",
+        "rows": foreign_rows, "shard_hash": foreign_hash,
+        "expected_current": task_id}, timeout=5)
+    assert r.status_code == 200
+    h = httpx.get(w1 + "/health", timeout=5).json()
+    assert h["task_id"] == "foreign-task" and h["round"] == 0
+    # Durable files reflect the replacement (crash-safe).
+    disk = json.loads((cluster["paths"]["w1"] / "shard.json").read_text())
+    assert disk["task_id"] == "foreign-task"
+
+
+def test_upload_with_worker_down_recovers_without_reupload(cluster, tmp_path):
+    """One side unreachable at upload time: the task is still admitted (202),
+    a concurrent second upload is rejected, and the ordinary start/resume
+    path re-delivers the missing shard - no CSV re-upload, no foreign rows."""
+    base = cluster["coord"]
+    cluster["w2"].hard_kill()
+
+    csv_path = _dataset_csv(tmp_path, n=30)
+    with open(csv_path, "rb") as f:
+        r = httpx.post(base + "/api/job?rounds=10",
+                       files={"file": ("d.csv", f, "text/csv")}, timeout=20)
+    assert r.status_code == 202  # admitted, shard delivery pending
+    st = r.json()
+    assert st["status"] == "paused" and st["last_error"]
+    task_id = st["task_id"]
+
+    # A second upload while one side is down must be rejected, not queued.
+    other = _csv_text(28, seed=99)
+    r2 = httpx.post(base + "/api/job?rounds=5",
+                    files={"file": ("o.csv", other, "text/csv")}, timeout=10)
+    assert r2.status_code == 409
+
+    # Starting while worker2 is still down fails cleanly and keeps the task.
+    r3 = httpx.post(base + "/api/start", timeout=20)
+    assert r3.status_code == 503
+    st = httpx.get(base + "/api/status", timeout=5).json()
+    assert st["status"] == "paused" and st["task_id"] == task_id
+
+    # Bring worker2 back: the ordinary recovery path must heal the shard
+    # from the durable job and train the ORIGINAL task to completion.
+    cluster["w2"].start()
+    httpx.post(base + "/api/start", timeout=20).raise_for_status()
+    st = _wait_status(base, lambda d: d["status"] == "completed")
+    assert st["task_id"] == task_id
+    assert st["confirmed_round"] == 10
+
+    h2 = httpx.get(f"http://127.0.0.1:{cluster['w2'].port}/health",
+                   timeout=5).json()
+    assert h2["task_id"] == task_id and h2["n"] == 30 - (30 + 1) // 2
+    # Exactly the uploaded data was trained (reference is bit-identical).
+    ref = httpx.get(base + "/api/reference", timeout=10).json()
+    for k, point in enumerate(st["loss_history"]):
+        assert point["loss"] == ref["loss"][k]
+    x, y = _parse_csv_text(csv_path.read_text())
+    ws, _, _ = lrmath.reference_train(x, y, 10)
+    np.testing.assert_array_equal(np.asarray(st["w"]), np.asarray(ws[-1]))
+
+
+def test_reset_clears_workers_for_next_upload(cluster, tmp_path):
+    """Reset clears both workers; the next upload starts from empty processes
+    even though they still hold the previous task's shard."""
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=4)
+    _wait_status(base, lambda d: d["status"] == "completed")
+
+    httpx.post(base + "/api/reset", timeout=10).raise_for_status()
+    st = httpx.get(base + "/api/status", timeout=5).json()
+    assert "task_id" not in st or st.get("status") is None
+    for wid in ("worker1", "worker2"):
+        assert st["workers"][wid]["task_id"] is None
+
+    # A fresh upload afterwards is admitted and consistent everywhere.
+    csv_path = _dataset_csv(tmp_path, n=22)
+    _create_and_start(base, csv_path, rounds=5)
+    st = _wait_status(base, lambda d: d["status"] == "completed")
+    assert st["confirmed_round"] == 5
+    ref = httpx.get(base + "/api/reference", timeout=10).json()
+    for k, point in enumerate(st["loss_history"]):
+        assert point["loss"] == ref["loss"][k]
+
+
+def test_reupload_after_completion_replaces_shards(cluster, tmp_path):
+    """Uploading a new CSV after the previous task COMPLETED is admitted and
+    replaces the workers' shards via the authorised CAS path (no reset)."""
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path, n=30), rounds=4)
+    st = _wait_status(base, lambda d: d["status"] == "completed")
+    old_task = st["task_id"]
+
+    # New upload without an explicit reset: admitted because the previous
+    # task is completed.
+    csv2 = tmp_path / "second.csv"
+    csv2.write_text(_csv_text(26, seed=42), encoding="utf-8")
+    with open(csv2, "rb") as f:
+        r = httpx.post(base + "/api/job?rounds=5",
+                       files={"file": ("s.csv", f, "text/csv")}, timeout=15)
+    assert r.status_code == 200
+    new_task = r.json()["task_id"]
+    assert new_task != old_task
+
+    st = httpx.get(base + "/api/status", timeout=5).json()
+    for wid in ("worker1", "worker2"):
+        h = st["workers"][wid]
+        assert h["task_id"] == new_task and h["shard_match"] is True
+        assert h["round"] == 0  # replaced shards start from round zero
+
+    httpx.post(base + "/api/start", timeout=15).raise_for_status()
+    st = _wait_status(base, lambda d: d["status"] == "completed")
+    x, y = _parse_csv_text(csv2.read_text())
+    ws, _, losses = lrmath.reference_train(x, y, 5)
+    for k, point in enumerate(st["loss_history"]):
+        assert point["loss"] == losses[k]
+    np.testing.assert_array_equal(np.asarray(st["w"]), np.asarray(ws[-1]))

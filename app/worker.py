@@ -13,6 +13,20 @@ generation). A worker only serves round traffic for the generation installed by
 ``/prepare``; messages from an older/unknown generation are rejected with 409,
 so a late message from a dead training group can never advance a new group.
 
+Shard fencing (compare-and-swap)
+--------------------------------
+``/load`` carries a ``shard_hash`` (content fingerprint) and an
+``expected_current`` CAS token:
+
+* a worker holding no shard accepts any well-formed load;
+* a load for the *same* task with the *same* content hash is an idempotent
+  re-delivery (recovery path) and never resets training state;
+* a load for a *different* task is only honoured when ``expected_current``
+  names the task this worker currently holds (an explicit, coordinator
+  authorised replacement); anything else is rejected with 409, so a late
+  shard push from a rejected/concurrent upload can never overwrite the
+  accepted task's shard.
+
 Crash semantics
 ---------------
 ``/commit`` applies one momentum step and *atomically* persists the new state
@@ -35,7 +49,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import lrmath
-from storage import atomic_write_json, if_exists_read_json
+from storage import atomic_write_json, content_hash, if_exists_read_json
 
 WORKER_ID = os.environ.get("WORKER_ID", "worker")
 DATA_DIR = os.environ.get("WORKER_DATA", "/data")
@@ -48,12 +62,14 @@ app = FastAPI(title=f"lr-worker-{WORKER_ID}")
 class WorkerState:
     def __init__(self) -> None:
         self.task_id: Optional[str] = None
+        self.shard_hash: Optional[str] = None
         self.gen: Optional[int] = None  # active fencing generation
         self.round: int = 0
         self.w: np.ndarray = lrmath.zero_buffers()
         self.v: np.ndarray = lrmath.zero_buffers()
         self.x_aug: Optional[np.ndarray] = None
         self.y: Optional[np.ndarray] = None
+        self.n_rows: int = 0
         self.delay_seconds: float = 0.0
         self.started_at: float = time.time()
         self._load_durable()
@@ -63,6 +79,9 @@ class WorkerState:
         shard = if_exists_read_json(SHARD_PATH)
         if shard:
             self.task_id = shard["task_id"]
+            # Older shards may lack a hash; the coordinator re-delivers and
+            # heals when its fingerprint check sees the mismatch.
+            self.shard_hash = shard.get("shard_hash")
             self._install_shard(shard["rows"])
         state = if_exists_read_json(STATE_PATH)
         if state:
@@ -77,6 +96,7 @@ class WorkerState:
         xs = np.asarray([r["x"] for r in rows], dtype=np.float64)
         self.x_aug = lrmath.augment(xs)
         self.y = np.asarray([r["y"] for r in rows], dtype=np.float64)
+        self.n_rows = int(xs.shape[0])
 
     # ------------------------------------------------------------------ guards
     def check_fence(self, task_id: str, gen: int) -> None:
@@ -96,25 +116,80 @@ class WorkerState:
             await asyncio.sleep(self.delay_seconds)
 
     # ------------------------------------------------------------------ actions
-    def load_task(self, task_id: str, worker_id: str, rows: list) -> None:
+    def load_task(self, task_id: str, worker_id: str, rows: list,
+                  shard_hash: str,
+                  expected_current: Optional[str]) -> Dict[str, Any]:
         if worker_id != WORKER_ID:
             raise HTTPException(status_code=400,
                                 detail=f"this worker is {WORKER_ID}")
-        # New task (or re-creation): wipe all previous durable state.
+        # Content integrity: the bytes received must fingerprint to the hash
+        # the coordinator computed for this shard.
+        if content_hash(rows) != shard_hash:
+            raise HTTPException(status_code=400,
+                                detail="shard content hash mismatch")
+        if self.task_id == task_id:
+            # Idempotent re-delivery of the SAME task's shard (recovery path:
+            # e.g. this worker was unreachable at upload time). Training state
+            # is kept; /prepare will align it to the confirmed round anyway.
+            if self.shard_hash is not None and self.shard_hash != shard_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="same task id but different shard content")
+            if self.x_aug is None:
+                self._install_shard(rows)
+                self._persist_shard(task_id, rows, shard_hash)
+            self.shard_hash = shard_hash
+            return {"worker_id": WORKER_ID, "task_id": task_id,
+                    "shard_hash": shard_hash, "n": self.n_rows,
+                    "round": self.round, "reloaded": True}
+        if self.task_id is not None and expected_current != self.task_id:
+            # CAS fence: never let an unexpected/late load overwrite the
+            # accepted task this worker currently serves.
+            raise HTTPException(
+                status_code=409,
+                detail=f"worker holds task {self.task_id}; refusing "
+                       f"unauthorised replacement")
+        # Fresh install or coordinator-authorised replacement: wipe all
+        # previous durable state.
         self.task_id = task_id
+        self.shard_hash = shard_hash
         self._install_shard(rows)
         self.round = 0
         self.w = lrmath.zero_buffers()
         self.v = lrmath.zero_buffers()
         self.gen = None
-        atomic_write_json(SHARD_PATH, {
-            "task_id": task_id, "worker_id": WORKER_ID,
-            "rows": rows, "n": len(rows),
-        })
+        self._persist_shard(task_id, rows, shard_hash)
         atomic_write_json(STATE_PATH, {
             "task_id": task_id, "gen": None, "round": 0,
             "w": lrmath.to_list(self.w), "v": lrmath.to_list(self.v),
         })
+        return {"worker_id": WORKER_ID, "task_id": task_id,
+                "shard_hash": shard_hash, "n": self.n_rows,
+                "round": self.round, "reloaded": False}
+
+    def _persist_shard(self, task_id: str, rows: list,
+                       shard_hash: str) -> None:
+        atomic_write_json(SHARD_PATH, {
+            "task_id": task_id, "worker_id": WORKER_ID,
+            "shard_hash": shard_hash, "rows": rows, "n": len(rows),
+        })
+
+    def clear(self) -> None:
+        """Forget any held task (coordinator reset). Durable files removed."""
+        self.task_id = None
+        self.shard_hash = None
+        self.gen = None
+        self.round = 0
+        self.w = lrmath.zero_buffers()
+        self.v = lrmath.zero_buffers()
+        self.x_aug = None
+        self.y = None
+        self.n_rows = 0
+        for path in (SHARD_PATH, STATE_PATH):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
     def prepare(self, task_id: str, gen: int, round_: int,
                 w: list, v: list) -> Dict[str, Any]:
@@ -201,6 +276,8 @@ class LoadIn(BaseModel):
     task_id: str
     worker_id: str
     rows: list = Field(..., min_length=1)
+    shard_hash: str
+    expected_current: Optional[str] = None
 
 
 class PrepareIn(BaseModel):
@@ -233,7 +310,9 @@ class DelayIn(BaseModel):
 async def health() -> Dict[str, Any]:
     return {
         "worker_id": WORKER_ID, "alive": True,
-        "task_id": STATE.task_id, "gen": STATE.gen,
+        "task_id": STATE.task_id, "shard_hash": STATE.shard_hash,
+        "n": STATE.n_rows,
+        "gen": STATE.gen,
         "round": STATE.round, "durable_round": STATE.round,
         "delay_seconds": STATE.delay_seconds,
         "uptime": round(time.time() - STATE.started_at, 3),
@@ -243,9 +322,16 @@ async def health() -> Dict[str, Any]:
 
 @app.post("/load")
 async def load(body: LoadIn) -> Dict[str, Any]:
-    STATE.load_task(body.task_id, body.worker_id, body.rows)
-    return {"worker_id": WORKER_ID, "task_id": STATE.task_id,
-            "n": STATE.x_aug.shape[0], "round": STATE.round}
+    return STATE.load_task(body.task_id, body.worker_id, body.rows,
+                           body.shard_hash, body.expected_current)
+
+
+@app.post("/reset")
+async def reset() -> Dict[str, Any]:
+    # Coordinator-initiated clear: drop any held shard/state so a brand new
+    # task can be loaded afterwards.
+    STATE.clear()
+    return {"worker_id": WORKER_ID, "cleared": True}
 
 
 @app.post("/prepare")

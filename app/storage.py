@@ -14,6 +14,7 @@ the previous complete round" hold even across a power loss / container kill.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -50,6 +51,16 @@ def atomic_write_text(path: str, text: str) -> None:
 def atomic_write_json(path: str, payload: Any) -> None:
     atomic_write_text(path, json.dumps(payload, separators=(",", ":"),
                                        sort_keys=True))
+
+
+def content_hash(payload: Any) -> str:
+    """Stable SHA-256 over the canonical JSON form (sorted keys, compact).
+
+    Coordinator and workers use this to fingerprint a shard's row content so
+    both sides can verify they hold *exactly* the same samples for a task.
+    """
+    blob = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def read_json(path: str) -> Any:

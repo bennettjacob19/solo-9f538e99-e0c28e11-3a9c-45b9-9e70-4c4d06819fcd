@@ -59,9 +59,11 @@ def probabilities(x_aug: np.ndarray, w: Sequence[float]) -> np.ndarray:
 def bce_loss(x_aug: np.ndarray, y: np.ndarray, w: Sequence[float]) -> float:
     """Mean binary cross-entropy over a shard or the full dataset."""
     p = probabilities(x_aug, w)
-    eps = 0.0
-    # Clip only to guard log(0); stable sigmoid keeps p inside (0, 1).
-    p = np.clip(p, 1e-300, 1.0 - 1e-300)
+    # Guard log(0): the stable sigmoid can still return exactly 0.0/1.0 when
+    # exp(-|z|) underflows, which would make the loss inf/NaN and poison the
+    # JSON status/weight documents. 1e-15 is representable in float64
+    # (unlike 1-1e-300 == 1.0) and caps the per-sample loss at ~34.5.
+    p = np.clip(p, 1e-15, 1.0 - 1e-15)
     total = -np.sum(y * np.log(p) + (1.0 - y) * np.log(1.0 - p))
     return float(total / x_aug.shape[0])
 

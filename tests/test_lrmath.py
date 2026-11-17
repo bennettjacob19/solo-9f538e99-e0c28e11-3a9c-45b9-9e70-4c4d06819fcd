@@ -80,3 +80,13 @@ def test_bit_identical_repeat_runs():
 def test_sigmoid_stable_at_extremes():
     p = lr.sigmoid(np.array([-1000.0, 0.0, 1000.0]))
     assert p[0] == 0.0 and p[1] == 0.5 and p[2] == 1.0
+
+
+def test_bce_loss_finite_under_saturation():
+    """Confidently-wrong predictions must yield a finite (large) loss, never
+    inf/NaN, so the JSON status/weight documents stay valid."""
+    x = np.array([[1.0, 1.0], [-1.0, -1.0]])
+    y = np.array([0.0, 1.0])
+    w = np.array([0.0, 500.0, 500.0])  # strongly predicts the opposite of y
+    loss = lr.bce_loss(lr.augment(x), y, w)
+    assert np.isfinite(loss) and loss > 0
